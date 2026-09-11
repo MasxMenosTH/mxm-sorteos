@@ -207,7 +207,7 @@
     .stage{min-height:600px;display:flex;flex-direction:column}
     .stats{
       display:grid;
-      grid-template-columns:repeat(4,1fr);
+      grid-template-columns:repeat(5,1fr);
       gap:12px;
       margin-bottom:18px;
     }
@@ -356,6 +356,9 @@
       to{transform:translateY(110vh) rotate(720deg);opacity:.75}
     }
 
+    @media(max-width:1200px){
+      .stats{grid-template-columns:repeat(3,1fr)}
+    }
     @media(max-width:1000px){
       .grid{grid-template-columns:1fr}
       .hero{grid-template-columns:1fr}
@@ -455,11 +458,13 @@
         <button id="exportBtn" class="btn dark" disabled>Exportar resultados</button>
         <button id="clearBtn" class="btn light">Limpiar base</button>
       </div>
+      <button id="errorReportBtn" class="btn red" style="width:100%;margin-top:10px" disabled>Descargar reporte de errores</button>
 
       <div id="fileHash" class="hash"></div>
       <div id="validationStatus" class="status"></div>
 
       <div class="note">
+        <strong>Control previo obligatorio:</strong> el sorteo solo se habilita con 0 errores. Si la base presenta novedades, descargue el reporte, corrija y vuelva a cargarla.<br><br>
         Columnas: almacen, sorteo, encabezado, detalle, boletas, factura, vr_registro,
         vr_factura, fecha_proceso, usuario_proceso, nit_cliente, nombre_cliente.
       </div>
@@ -467,10 +472,11 @@
 
     <section class="card stage">
       <div class="stats">
-        <div class="stat"><span>Clientes elegibles</span><strong id="clients">0</strong></div>
-        <div class="stat"><span>Boletas elegibles</span><strong id="tickets">0</strong></div>
+        <div class="stat"><span>Clientes participantes</span><strong id="clients">0</strong></div>
+        <div class="stat"><span>Oportunidades en sorteo</span><strong id="tickets">0</strong></div>
         <div class="stat"><span>Registros válidos</span><strong id="rows">0</strong></div>
-        <div class="stat"><span>Ganadores</span><strong id="wins">0</strong></div>
+        <div class="stat"><span>Errores bloqueantes</span><strong id="errors">0</strong></div>
+        <div class="stat"><span>Ganadores</span><strong id="wins">0 / 1</strong></div>
       </div>
 
       <div class="machine">
@@ -533,6 +539,10 @@ const COLS = [
 
 const state = {
   allRows: [],
+  rawRows: [],
+  sourceHeaders: [],
+  validationErrors: [],
+  invalidRowIds: new Set(),
   winners: [],
   blockedClients: new Set(),
   fileName: "",
@@ -583,9 +593,151 @@ function normalizeRow(raw, idx){
   };
 }
 
-function validRow(r){
+function baseRowIsStructurallyValid(r){
   return r.almacen && r.sorteo && r.factura && r.nit_cliente && r.nombre_cliente &&
-         Number.isInteger(r.boletas) && r.boletas > 0;
+         Number.isSafeInteger(r.boletas) && r.boletas > 0;
+}
+
+function normalizedName(v){
+  return text(v).toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/\s+/g," ");
+}
+
+function addValidationError(list, rowId, code, field, currentValue, detail, action){
+  list.push({
+    fila_excel: rowId === null ? "ARCHIVO" : rowId + 2,
+    rowId,
+    codigo: code,
+    campo: field,
+    valor_actual: text(currentValue),
+    detalle,
+    accion_recomendada: action
+  });
+}
+
+function validateBase(){
+  const errors = [];
+  const requiredColumns = [...COLS];
+  const actualHeaders = new Set(state.sourceHeaders.map(key));
+
+  for (const col of requiredColumns){
+    if (!actualHeaders.has(col)){
+      addValidationError(
+        errors, null, "COLUMNA_FALTANTE", col, "",
+        `No existe la columna obligatoria '${col}' en el archivo.`,
+        `Agregue la columna '${col}' usando la plantilla oficial.`
+      );
+    }
+  }
+
+  for (const r of state.allRows){
+    const requiredValues = ["almacen","sorteo","factura","nit_cliente","nombre_cliente"];
+    for (const field of requiredValues){
+      if (!text(r[field])){
+        addValidationError(
+          errors,r._id,"CAMPO_OBLIGATORIO_VACIO",field,r[field],
+          `El campo '${field}' está vacío.`,
+          `Complete '${field}' antes de volver a cargar el archivo.`
+        );
+      }
+    }
+
+    if (!Number.isFinite(r.boletas)){
+      addValidationError(errors,r._id,"BOLETAS_NO_NUMERICAS","boletas",r.boletas,
+        "La cantidad de boletas no es un número válido.",
+        "Ingrese un número entero positivo, por ejemplo 1, 2, 3...");
+    } else if (!Number.isInteger(r.boletas)){
+      addValidationError(errors,r._id,"BOLETAS_DECIMALES","boletas",r.boletas,
+        "La cantidad de boletas contiene decimales.",
+        "Corrija la cantidad a un número entero positivo según la participación real.");
+    } else if (r.boletas <= 0){
+      addValidationError(errors,r._id,"BOLETAS_NO_POSITIVAS","boletas",r.boletas,
+        "La cantidad de boletas debe ser mayor que cero.",
+        "Corrija el valor o elimine el registro si no debe participar.");
+    } else if (!Number.isSafeInteger(r.boletas)){
+      addValidationError(errors,r._id,"BOLETAS_FUERA_RANGO","boletas",r.boletas,
+        "La cantidad de boletas está fuera del rango entero seguro.",
+        "Revise el dato de origen.");
+    }
+  }
+
+  // Regla de granularidad: una sola fila por sorteo + almacén + factura + cliente.
+  const participationGroups = new Map();
+  for (const r of state.allRows){
+    if (!r.sorteo || !r.almacen || !r.factura || !r.nit_cliente) continue;
+    const k = [r.sorteo,r.almacen,r.factura,r.nit_cliente].map(v=>text(v).toUpperCase()).join("|");
+    if (!participationGroups.has(k)) participationGroups.set(k,[]);
+    participationGroups.get(k).push(r);
+  }
+  for (const group of participationGroups.values()){
+    if (group.length > 1){
+      const rows = group.map(r=>r._id+2).join(", ");
+      for (const r of group){
+        addValidationError(
+          errors,r._id,"PARTICIPACION_DUPLICADA","factura",r.factura,
+          `La misma participación sorteo + almacén + factura + cliente aparece ${group.length} veces (filas ${rows}). Puede estar repitiendo boletas por detalle.`,
+          "Consolide la participación en una sola fila y deje en 'boletas' el total definitivo que corresponde a esa factura/cliente."
+        );
+      }
+    }
+  }
+
+  // Una misma factura del mismo sorteo/almacén no debe pertenecer a documentos diferentes.
+  const invoiceGroups = new Map();
+  for (const r of state.allRows){
+    if (!r.sorteo || !r.almacen || !r.factura || !r.nit_cliente) continue;
+    const k = [r.sorteo,r.almacen,r.factura].map(v=>text(v).toUpperCase()).join("|");
+    if (!invoiceGroups.has(k)) invoiceGroups.set(k,[]);
+    invoiceGroups.get(k).push(r);
+  }
+  for (const group of invoiceGroups.values()){
+    const docs = new Set(group.map(r=>r.nit_cliente));
+    if (docs.size > 1){
+      for (const r of group){
+        addValidationError(errors,r._id,"FACTURA_MULTIPLE_CLIENTE","nit_cliente",r.nit_cliente,
+          `La factura ${r.factura} está asociada a más de un documento de cliente.`,
+          "Verifique el cliente correcto asociado a la factura.");
+      }
+    }
+  }
+
+  // Un documento debería mantener un mismo nombre de cliente dentro del archivo.
+  const clientNames = new Map();
+  for (const r of state.allRows){
+    if (!r.nit_cliente || !r.nombre_cliente) continue;
+    const doc = r.nit_cliente;
+    if (!clientNames.has(doc)) clientNames.set(doc,new Map());
+    const names = clientNames.get(doc);
+    const nn = normalizedName(r.nombre_cliente);
+    if (!names.has(nn)) names.set(nn,[]);
+    names.get(nn).push(r);
+  }
+  for (const names of clientNames.values()){
+    if (names.size > 1){
+      const all = [...names.values()].flat();
+      const variants = [...names.keys()].join(" | ");
+      for (const r of all){
+        addValidationError(errors,r._id,"CLIENTE_NOMBRE_INCONSISTENTE","nombre_cliente",r.nombre_cliente,
+          `El documento ${r.nit_cliente} aparece con nombres diferentes: ${variants}.`,
+          "Unifique el nombre del cliente para el mismo documento.");
+      }
+    }
+  }
+
+  const structurallyValid = state.allRows.filter(baseRowIsStructurallyValid);
+  const total = structurallyValid.reduce((a,r)=>a+r.boletas,0);
+  if (total > 4294967296){
+    addValidationError(errors,null,"TOTAL_BOLETAS_FUERA_RANGO","boletas",total,
+      "El total de oportunidades supera el rango soportado por esta versión.",
+      "Divida el universo del sorteo o solicite una versión para volúmenes superiores.");
+  }
+
+  state.validationErrors = errors;
+  state.invalidRowIds = new Set(errors.filter(e=>e.rowId !== null).map(e=>e.rowId));
+  return errors;
+}
+
+function validRow(r){
+  return baseRowIsStructurallyValid(r) && !state.invalidRowIds.has(r._id);
 }
 
 function filteredRows(){
@@ -691,42 +843,40 @@ function updateFilters(){
   fillSelect("filterAlmacen", state.allRows.map(r=>r.almacen));
 }
 
-function potentialDuplicates(){
-  const seen = new Set();
-  let dup = 0;
-  for (const r of state.allRows.filter(validRow)){
-    const k = [r.sorteo,r.almacen,r.factura,r.nit_cliente,r.boletas].join("|").toLowerCase();
-    if (seen.has(k)) dup++;
-    else seen.add(k);
-  }
-  return dup;
-}
-
 function updateStats(){
   const rows = filteredRows();
+  const maxW = Math.max(1, Number(el("winnerCount").value || 1));
+  const errorCount = state.validationErrors.length;
+
   el("clients").textContent = nf.format(uniqueClients(rows));
   el("tickets").textContent = nf.format(totalTickets(rows));
-  el("rows").textContent = nf.format(rows.length);
-  el("wins").textContent = nf.format(state.winners.length);
+  el("rows").textContent = nf.format(state.allRows.filter(validRow).length);
+  el("errors").textContent = nf.format(errorCount);
+  el("wins").textContent = `${nf.format(state.winners.length)} / ${nf.format(maxW)}`;
 
-  const maxW = Math.max(1, Number(el("winnerCount").value || 1));
+  // COMPUERTA DE SEGURIDAD: con un solo error, no existe sorteo.
   el("drawBtn").disabled =
-    state.drawing || rows.length === 0 || totalTickets(rows) <= 0 || state.winners.length >= maxW;
+    state.drawing || errorCount > 0 || rows.length === 0 || totalTickets(rows) <= 0 || state.winners.length >= maxW;
 
   el("exportBtn").disabled = state.winners.length === 0;
+  el("errorReportBtn").disabled = errorCount === 0;
 
   if (state.allRows.length){
-    const invalid = state.allRows.filter(r=>!validRow(r)).length;
-    const dup = potentialDuplicates();
-    const base = `<strong>Base cargada:</strong> ${nf.format(state.allRows.length)} registros. ` +
-                 `${nf.format(state.allRows.filter(validRow).length)} válidos.`;
-    if (invalid || dup){
-      setStatus("validationStatus","warn",
-        base + `<br>${invalid ? "Registros inválidos: "+nf.format(invalid)+". " : ""}` +
-        `${dup ? "Posibles registros duplicados por sorteo/almacén/factura/cliente/boletas: "+nf.format(dup)+". Revise antes del sorteo oficial." : ""}`
+    if (errorCount > 0){
+      setStatus("validationStatus","error",
+        `<strong>BASE BLOQUEADA.</strong> Se detectaron ${nf.format(errorCount)} error(es) de validación. ` +
+        `El botón de sorteo permanecerá deshabilitado hasta cargar un archivo con <strong>0 errores</strong>. ` +
+        `Descargue el reporte, corrija el archivo y vuelva a cargarlo.`
       );
-    } else {
-      setStatus("validationStatus","ok",base + " No se detectaron novedades críticas.");
+      el("reelTop").textContent = "VALIDACIÓN OBLIGATORIA";
+      el("reelCenter").textContent = "BASE CON ERRORES";
+      el("reelBottom").textContent = `${nf.format(errorCount)} error(es) por corregir`;
+      el("winnerInfo").innerHTML = `<strong>Sorteo bloqueado</strong><div>Descargue el reporte de errores y corrija la base.</div>`;
+    }else{
+      setStatus("validationStatus","ok",
+        `<strong>BASE VALIDADA.</strong> ${nf.format(state.allRows.length)} registros analizados, ` +
+        `${nf.format(state.allRows.filter(validRow).length)} válidos y <strong>0 errores</strong>. El sorteo está habilitado.`
+      );
     }
   }
 
@@ -735,7 +885,9 @@ function updateStats(){
   }
 }
 
-async function loadRows(rows, fileName="Datos demo", arrayBuffer=null){
+async function loadRows(rows, fileName="Datos demo", arrayBuffer=null, headers=null){
+  state.rawRows = rows.map(r=>({...r}));
+  state.sourceHeaders = headers || (rows[0] ? Object.keys(rows[0]) : []);
   state.allRows = rows.map((r,i)=>normalizeRow(r,i)).filter(r =>
     Object.values(r).some(v => text(v) !== "")
   );
@@ -744,6 +896,7 @@ async function loadRows(rows, fileName="Datos demo", arrayBuffer=null){
   state.auditHash = "GENESIS";
   state.officialConfirmed = false;
   state.fileName = fileName;
+  validateBase();
 
   if (arrayBuffer){
     state.fileHash = await sha256(arrayBuffer);
@@ -759,11 +912,13 @@ async function loadRows(rows, fileName="Datos demo", arrayBuffer=null){
   renderWinners();
   updateStats();
 
-  const names = filteredRows().slice(0,3).map(r=>r.nombre_cliente);
-  el("reelTop").textContent = names[0] || "Base cargada";
-  el("reelCenter").textContent = names[1] || "+ X −";
-  el("reelBottom").textContent = names[2] || "Listo para sortear";
-  el("winnerInfo").innerHTML = `<strong>Base preparada</strong><div>${nf.format(totalTickets(filteredRows()))} boletas elegibles.</div>`;
+  if (state.validationErrors.length === 0){
+    const names = filteredRows().slice(0,3).map(r=>r.nombre_cliente);
+    el("reelTop").textContent = names[0] || "Base validada";
+    el("reelCenter").textContent = names[1] || "+ X −";
+    el("reelBottom").textContent = names[2] || "Listo para sortear";
+    el("winnerInfo").innerHTML = `<strong>Base validada</strong><div>${nf.format(totalTickets(filteredRows()))} oportunidades en sorteo · 0 errores.</div>`;
+  }
 }
 
 async function handleFile(file){
@@ -772,9 +927,11 @@ async function handleFile(file){
     const buffer = await file.arrayBuffer();
     const wb = XLSX.read(buffer,{type:"array"});
     const ws = wb.Sheets[wb.SheetNames[0]];
+    const matrix = XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
+    const headers = (matrix[0] || []).map(v=>text(v));
     const raw = XLSX.utils.sheet_to_json(ws,{defval:""});
     if (!raw.length) throw new Error("El archivo no contiene registros.");
-    await loadRows(raw,file.name,buffer);
+    await loadRows(raw,file.name,buffer,headers);
   }catch(err){
     console.error(err);
     setStatus("validationStatus","error","No fue posible leer el archivo: " + err.message);
@@ -831,6 +988,10 @@ function confetti(){
 
 async function draw(){
   if (state.drawing) return;
+  if (state.validationErrors.length > 0){
+    setStatus("drawStatus","error","El sorteo está bloqueado: la base debe tener 0 errores de validación.");
+    return;
+  }
 
   const name = eventName();
   const maxW = Math.max(1, Number(el("winnerCount").value || 1));
@@ -845,7 +1006,8 @@ async function draw(){
       `Evento: ${name}\n` +
       `Clientes elegibles: ${uniqueClients(pool)}\n` +
       `Boletas elegibles: ${totalTickets(pool)}\n` +
-      `Ganadores configurados: ${maxW}\n\n` +
+      `Ganadores configurados: ${maxW}\n` +
+      `Errores de validación: 0\n\n` +
       `¿Confirma que desea continuar?`
     );
     if (!ok) return;
@@ -976,6 +1138,10 @@ function resetDraw(){
 function clearBase(){
   if ((state.allRows.length || state.winners.length) && !confirm("Se limpiará la base y el sorteo actual. ¿Continuar?")) return;
   state.allRows=[];
+  state.rawRows=[];
+  state.sourceHeaders=[];
+  state.validationErrors=[];
+  state.invalidRowIds=new Set();
   state.winners=[];
   state.blockedClients=new Set();
   state.fileName="";
@@ -997,6 +1163,53 @@ function clearBase(){
   clearStatus("drawStatus");
   renderWinners();
   updateStats();
+}
+
+function downloadErrorReport(){
+  if (!state.validationErrors.length) return;
+
+  const rowErrors = new Map();
+  for (const e of state.validationErrors){
+    if (e.rowId === null) continue;
+    if (!rowErrors.has(e.rowId)) rowErrors.set(e.rowId,[]);
+    rowErrors.get(e.rowId).push(e);
+  }
+
+  const baseToCorrect = state.rawRows.map((raw,i)=>{
+    const errs = rowErrors.get(i) || [];
+    return {
+      ...raw,
+      ESTADO_VALIDACION: errs.length ? "ERROR" : "OK",
+      ERRORES_VALIDACION: errs.map(e=>`${e.codigo}: ${e.detalle}`).join(" | "),
+      ACCION_RECOMENDADA: [...new Set(errs.map(e=>e.accion_recomendada))].join(" | ")
+    };
+  });
+
+  const summary = [{
+    archivo: state.fileName,
+    fecha_validacion: new Date().toLocaleString("es-CO"),
+    registros_cargados: state.allRows.length,
+    registros_sin_error: state.allRows.filter(validRow).length,
+    filas_con_error: state.invalidRowIds.size,
+    total_errores: state.validationErrors.length,
+    estado: state.validationErrors.length ? "BLOQUEADO - CORREGIR Y RECARGAR" : "APROBADO",
+    hash_base_sha256: state.fileHash
+  }];
+
+  const errors = state.validationErrors.map(e=>({
+    fila_excel:e.fila_excel,
+    codigo_error:e.codigo,
+    campo:e.campo,
+    valor_actual:e.valor_actual,
+    detalle:e.detalle,
+    accion_recomendada:e.accion_recomendada
+  }));
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(summary),"Resumen");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(errors),"Errores");
+  XLSX.utils.book_append_sheet(wb,XLSX.utils.json_to_sheet(baseToCorrect),"Base_para_corregir");
+  XLSX.writeFile(wb,`Reporte_Errores_${eventName().replace(/[^\w\-]+/g,"_")}.xlsx`);
 }
 
 function downloadTemplate(){
@@ -1086,6 +1299,7 @@ el("resetBtn").addEventListener("click",resetDraw);
 el("clearBtn").addEventListener("click",clearBase);
 el("templateBtn").addEventListener("click",downloadTemplate);
 el("exportBtn").addEventListener("click",exportResults);
+el("errorReportBtn").addEventListener("click",downloadErrorReport);
 el("demoBtn").addEventListener("click",()=>loadRows(demoRows(),"DATOS_DEMO"));
 
 updateEventLabels();
